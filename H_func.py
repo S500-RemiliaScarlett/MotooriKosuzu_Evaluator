@@ -4,12 +4,15 @@ import torch
 from transformers import BertTokenizer, BertModel
 import math
 import jieba
+import jieba.analyse as analyse
 import os
 import sys
-#H函数：文本自身的价值量
-#H=entropy(txt)*cos<domain_txt,domain_trg>
-#余弦因子需要通过监督学习。
+import sentence_transformers
 #学习原型机
+'''
+H=entropy(text)*cosine_similarity(domain_weight_vector,domain_weight_req)
+其中：两个领域是通过监督学习预测得到的向量进行零中心化后得到的标准向量
+'''
 import torch.nn as nn
 
 
@@ -18,7 +21,7 @@ import torch.nn as nn
 ###领域标签设计为控件，以便用户自主配置
 #######-----------Starting-----------------####
 #识文解意的爱书人明白文字中的价值。
-
+SIM_THRESHOLD=0.6
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(PROJECT_DIR, 'models', 'paraphrase-multilingual-MiniLM-L12-v2')
 WEIGHTS_PATH = os.path.join(PROJECT_DIR, 'model_params.pth')
@@ -83,14 +86,98 @@ def entropy(text,stopword=os.path.dirname(os.path.abspath(__file__))+'/stopwords
         p=word_tf[bg]/blen
         entr+=p*math.log2(p)
     return -entr
+def keyword_match(text:str, req:str, model_path):
+    kwtext = analyse.extract_tags(text, withWeight=True, allowPOS=('ns', 'n', 'vn', 'v'))
+    kwreq  = analyse.extract_tags(req,  withWeight=True, allowPOS=('ns', 'n', 'vn', 'v'))
+    Tseg = jieba.lcut(text, use_paddle=True)
+    p = len(kwtext)
+    q = len(kwreq)
+    if p == 0 or q == 0:            # 任一侧抽不到关键词
+        return 0.0
+
+    model = sentence_transformers.SentenceTransformer(model_path)
+
+    # 预编码关键词，避免在内层循环反复 encode（原来每个 (i,j) 都 encode 一次）
+    emb_text = [model.encode(kwtext[i][0]) for i in range(p)]
+    emb_req  = [model.encode(kwreq[j][0])  for j in range(q)]
+
+    # 相似度矩阵：model.similarity 返回 (1,1) 张量，这里取出标量 float
+    sim = [[0.0] * q for _ in range(p)]
+    for i in range(p):
+        for j in range(q):
+            sim[i][j] = float(model.similarity(emb_text[i], emb_req[j]).item())
+
+    # dp 尺寸 (p+1) x (q+1)，第 0 行 / 第 0 列全为 0 作为边界。
+    # 原来直接用 dp[i-1][j]、dp[i-1][j-1]、dp[i][j-1]，当 i=0 或 j=0 时会取到
+    # 负下标（dp[-1] = 最后一行、dp[i][-1] = 最后一列），把矩阵首尾相接成环，
+    # 导致同一权重被重复累加、每行都收敛成同一个值，match_score 被算到 >1。
+    dp   = [[0.0] * (q + 1) for _ in range(p + 1)]
+    step = [[None] * (q + 1) for _ in range(p + 1)]
+    for i in range(1, p + 1):
+        for j in range(1, q + 1):
+            s1 = dp[i - 1][j]                       # 跳过 text 关键词 i-1
+            s2 = dp[i - 1][j - 1]                   # 匹配 text[i-1] 与 req[j-1]
+            if sim[i - 1][j - 1] > SIM_THRESHOLD:
+                s2 += kwreq[j - 1][1] * sim[i - 1][j - 1]
+            s3 = dp[i][j - 1]                       # 跳过 req 关键词 j-1
+            best = s1
+            step[i][j] = (i - 1, j)
+            if s2 > best:
+                best = s2
+                step[i][j] = (i - 1, j - 1)
+            if s3 > best:
+                best = s3
+                step[i][j] = (i, j - 1)
+            dp[i][j] = best
+
+    total_req = sum([x[1] for x in kwreq])
+    match_score = dp[p][q] / total_req if total_req > 0 else 0.0
+
+    # 回溯匹配路径，找出真正被匹配上的 text 关键词
+    path = []
+    i, j = p, q
+    while i > 0 and j > 0:
+        pi, pj = step[i][j]
+        if (pi, pj) == (i - 1, j - 1):              # 对角线 => text[i-1] 被匹配
+            path.append(i - 1)
+        i, j = pi, pj
+    matched = [kwtext[i][0] for i in set(path)]
+
+    # 定位匹配关键词在原文分词中的位置，用于计算密集度
+    locations = []
+    for w in matched:
+        s = -1
+        try:
+            s = Tseg.index(w)
+        except ValueError:
+            # 关键词不在分词结果中时，用 embedding 相似度找最近的分词位置
+            v1 = model.encode(w)
+            best_sim = -1.0
+            for idx, seg in enumerate(Tseg):
+                sim_val = float(model.similarity(v1, model.encode(seg)).item())
+                if sim_val > best_sim:
+                    best_sim = sim_val
+                    s = idx
+            if best_sim <= SIM_THRESHOLD:
+                s = -1
+        if s != -1:
+            locations.append(s)
+
+    if len(locations) == 0:
+        return 0.0
+
+    span = (max(locations) - min(locations) + 1) / len(Tseg)
+    density_score = math.exp(-2 * span)
+    return match_score * density_score
+    ###带权的最长子序列
+    #关键词应当以名词为主，动词为次进行
+    #关键词密集出现比分散出现的信息更容易强调客户端要求，且根据人的注意力衰减机制，如果文字太长关键词过于分散会导致人的兴趣下降、阅读困难
+    #对于返回值为0的情况：如果返回值为0，说明存在两种情况：一是用户表述笼统或者只需要领域，二是不符合具体要求事项，此时H非负时应该取最小值而不是0
 #向量分类函数作为可选项，允许开发者自行设计，默认使用torch.nn的监督学习
-def H_func(text:str,req:str,classifier_function):
+def H_func(text:str,req:str,classifier_function,kw_model=MODEL_PATH):
     entr=entropy(text)
     domain_weight_vector=classifier_function(text)
     domain_weight_req=classifier_function(req)
-    # 中心化后再算余弦：多标签 sigmoid 输出全为正、几乎都贴着「全1向量」方向，
-    # 直接余弦会得到一个恒接近 1 的公共基线，区分度低。减去均值后等价于皮尔逊相关，
-    # 反映「哪些领域突出、哪些被压低」的形状对齐，能拉开不同请求的差距（值域变为 [-1,1]）。
     v = domain_weight_vector - domain_weight_vector.mean()
     r = domain_weight_req - domain_weight_req.mean()
     dot_product = float((v * r).sum())
@@ -100,25 +187,33 @@ def H_func(text:str,req:str,classifier_function):
         cosine_similarity = 0
     else:
         cosine_similarity = dot_product / (norm_a * norm_b)
-    return [entr * cosine_similarity,domain_weight_vector,domain_weight_req]
+    match_rank=keyword_match(text,req,kw_model)
+    return [entr * (abs(cosine_similarity)**(2-match_rank)),cosine_similarity,match_rank,domain_weight_vector,domain_weight_req]
 class domain_classifier(torch.nn.Module):
     def __init__(self, num_domains,model=MODEL_PATH):
         super().__init__()
         self.bert = BertModel.from_pretrained(model)
         hidden_size = self.bert.config.hidden_size  # 从模型配置动态获取 hidden_size（MiniLM=384, BERT-base=768）
-        self.classifier = torch.nn.Linear(hidden_size, num_domains)
-    def forward(self, input_ids, attention_mask):
+        self.middle_layer = torch.nn.Linear(hidden_size, 233)
+        self.classifier=torch.nn.Linear(233,num_domains)
+    def forward(self, input_ids, attention_mask,using_pooler=True):
         outputs = self.bert(input_ids, attention_mask=attention_mask)
         # pooler_output 可能为 None（某些 SentenceTransformer 模型没有 pooler），
         # 此时回退到对 last_hidden_state 做 mean pooling。
         # 注意：混合训练会把短文本和长文本放进同一个 batch，若不屏蔽 padding，
         # 短文本会被大量 [PAD] 向量稀释，重新塌缩成「平行于全1向量」的平坦输出。
-        cls_vec = outputs.pooler_output
-        if cls_vec is None:
-            mask = attention_mask.unsqueeze(-1).to(outputs.last_hidden_state.dtype)
-            cls_vec = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-        logits = self.classifier(cls_vec)
-        weights = torch.sigmoid(logits)  # 多标签输出：每个领域独立 0~1，不强制和为1
+        if using_pooler==True:
+            cls_vec = outputs.pooler_output
+            if cls_vec is None:
+                mask = attention_mask.unsqueeze(-1).to(outputs.last_hidden_state.dtype)
+                cls_vec = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+        else:
+            cls_vec=outputs.last_hidden_state[:, 0]
+        logits = self.middle_layer(cls_vec)
+        Lrelu = torch.nn.LeakyReLU(negative_slope=1e-2)  
+        middleweights=Lrelu(logits)
+        output_logits=self.classifier(middleweights)
+        weights=torch.sigmoid(output_logits)# 多标签输出：每个领域独立 0~1，不强制和为1
         return weights
 
 
@@ -171,7 +266,14 @@ def build_mixed_dataset(dataset_path=DATASET_PATH, domains=DOMAINS,
             labels.append(list(one_hot))
     return texts, labels
 
-
+class TextDataset(torch.utils.data.Dataset):
+        def __init__(self, texts, labels):
+            self.texts = texts
+            self.labels = labels
+        def __len__(self):
+            return len(self.texts)
+        def __getitem__(self, idx):
+            return self.texts[idx], self.labels[idx]
 def train_domain_classifier(dataset_path=DATASET_PATH, domains=DOMAINS,
                             samples_per_domain=100, short_len=80,
                             epochs=10, batch_size=32, lr=2e-5, freeze_bert=False,
@@ -184,14 +286,7 @@ def train_domain_classifier(dataset_path=DATASET_PATH, domains=DOMAINS,
 
     运行方式： python H_func.py --train
     """
-    class TextDataset(torch.utils.data.Dataset):
-        def __init__(self, texts, labels):
-            self.texts = texts
-            self.labels = labels
-        def __len__(self):
-            return len(self.texts)
-        def __getitem__(self, idx):
-            return self.texts[idx], self.labels[idx]
+    
 
     texts, labels = build_mixed_dataset(dataset_path, domains, samples_per_domain, short_len)
     tokenizer = BertTokenizer.from_pretrained(MODEL_PATH)
@@ -213,7 +308,7 @@ def train_domain_classifier(dataset_path=DATASET_PATH, domains=DOMAINS,
             input_ids = inputs['input_ids']
             attention_mask = inputs['attention_mask']
             optimizer.zero_grad()
-            outputs = model(input_ids, attention_mask)  # forward 返回 sigmoid 权重
+            outputs = model(input_ids, attention_mask,using_pooler=False)  # forward 返回 sigmoid 权重
             # DataLoader 可能返回 list of tensors 或单个 tensor，统一处理
             if isinstance(batch_labels, torch.Tensor):
                 labels_tensor = batch_labels.float()
@@ -233,11 +328,33 @@ def train_domain_classifier(dataset_path=DATASET_PATH, domains=DOMAINS,
     model.eval()
     probe_texts = ["体育", "彩票行情", "我需要了解人工智能技术的新应用",
                    "新型摄像头+人工智能技术将用于足球裁判，有望提高判罚的准确性。"]
+    DEFAULT_CASES = [
+    ("人工智能芯片研发取得新突破", "科技"),
+    ("国产大模型正式发布参数破千亿", "科技"),
+    ("量子计算原型机实现里程碑突破", "科技"),
+    ("新款智能手机发布会定档下周", "科技"),
+    ("国足昨晚比赛获胜晋级下一轮", "体育"),
+    ("中国男篮夺得亚洲杯冠军", "体育"),
+    ("某明星官宣恋情引发热议", "娱乐"),
+    ("暑期档电影票房突破50亿", "娱乐"),
+    ("今日大盘上涨券商板块领涨", "股票"),
+    ("股市午后跳水创业板指跌超2%", "股票"),
+    ("央行宣布下调存款准备金率", "时政"),
+    ("国务院出台稳经济一揽子政策", "时政"),
+    ("教育部发布高等教育改革方案", "教育"),
+    ("高考成绩今日公布考生可查分", "教育"),
+    ("台风来袭沿海多城市停课停运", "社会"),
+    ("某地发生燃气泄漏事故紧急处置", "社会"),
+    ("某地楼市新政首付比例下调", "房产"),
+    ("某热门手游新版本今日上线", "游戏"),
+    ("双色球今晚开奖头奖井喷", "彩票"),
+]
+    probe_texts+=[x[0] for x in DEFAULT_CASES]
     print("训练后自检（Top3 领域权重）：")
     with torch.no_grad():
         for pt in probe_texts:
             inputs = tokenizer(pt, return_tensors="pt", truncation=True, padding=True)
-            w = model(inputs['input_ids'], inputs['attention_mask']).squeeze(0).numpy()
+            w = model(inputs['input_ids'], inputs['attention_mask'],using_pooler=False).squeeze(0).numpy()
             top = sorted(zip(domains, w), key=lambda x: -x[1])[:3]
             print(f"  「{pt}」-> " + " ".join(f"{d}:{v:.3f}" for d, v in top))
 
@@ -247,6 +364,8 @@ def train_domain_classifier(dataset_path=DATASET_PATH, domains=DOMAINS,
 
 if __name__ == "__main__":
     if "--train" in sys.argv:
+        if len(sys.argv)>1:
+            DATASET_PATH=sys.argv[1]
         train_domain_classifier()
         sys.exit(0)
     # 只加载一次模型和 tokenizer（旧版每次调用 classifier 都重建模型并读 470MB 权重）
@@ -258,19 +377,58 @@ if __name__ == "__main__":
     def classifier(text):
         inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
         with torch.no_grad():
-            domain_weight_vector = model(inputs['input_ids'], inputs['attention_mask']).squeeze(0).numpy()  # 长度为K的ndarray
+            # 必须与训练时的 using_pooler=False 保持一致（用 CLS token），否则训练/推理特征不一致，
+            # 分类头会输出接近平坦的 ~0.5，测试 loss 会卡在 ln2≈0.69 附近。
+            domain_weight_vector = model(inputs['input_ids'], inputs['attention_mask'], using_pooler=False).squeeze(0).numpy()  # 长度为K的ndarray
         return domain_weight_vector
-    text="新型摄像头+人工智能技术将用于足球裁判，有望提高判罚的准确性。"
-    req1="体育"
-    req2="我需要了解人工智能技术的新应用"
-    req3="彩票行情"
-    print(f"文本: {text}")
-    print(f"需求1: {req1}")
-    print(f"需求2: {req2}")
-    print(f"需求3: {req3}")
-    H_func_value1=H_func(text,req1,classifier)
-    H_func_value2=H_func(text,req2,classifier)
-    H_func_value3=H_func(text,req3,classifier)
-    print(f"H函数值1/分类: {H_func_value1}")
-    print(f"H函数值2/分类: {H_func_value2}")
-    print(f"H函数值3/分类: {H_func_value3}")
+    DEFAULT_CASES = [
+    ("人工智能芯片研发取得新突破", "科技"),
+    ("国产大模型正式发布参数破千亿", "科技"),
+    ("量子计算原型机实现里程碑突破", "科技"),
+    ("新款智能手机发布会定档下周", "科技"),
+    ("国足昨晚比赛获胜晋级下一轮", "体育"),
+    ("中国男篮夺得亚洲杯冠军", "体育"),
+    ("某明星官宣恋情引发热议", "娱乐"),
+    ("暑期档电影票房突破50亿", "娱乐"),
+    ("今日大盘上涨券商板块领涨", "股票"),
+    ("股市午后跳水创业板指跌超2%", "股票"),
+    ("央行宣布下调存款准备金率", "时政"),
+    ("国务院出台稳经济一揽子政策", "时政"),
+    ("教育部发布高等教育改革方案", "教育"),
+    ("高考成绩今日公布考生可查分", "教育"),
+    ("台风来袭沿海多城市停课停运", "社会"),
+    ("某地发生燃气泄漏事故紧急处置", "社会"),
+    ("某地楼市新政首付比例下调", "房产"),
+    ("某热门手游新版本今日上线", "游戏"),
+    ("双色球今晚开奖头奖井喷", "彩票"),
+]
+    dataset=[]
+    req="高考最新动态"
+    for i in DEFAULT_CASES:
+        s=[0]*13
+        s[DOMAINS.index(i[1])]=1
+        dataset.append((i[0],s))
+    dataset.append((req,[0,0,0,0,0,1,0,0,0,0,0,0,0]))
+    texts=[]
+    labels=[]
+    for i in dataset:
+        texts.append(i[0])
+        labels.append(i[1])
+    dset=TextDataset(texts,labels)
+    print("请求：",req)
+    print("分类结果:",classifier(req))
+    loss=torch.nn.BCELoss()
+    total_loss=0.0
+    p=0
+    for text,label in dset:  # 直接按样本迭代，避免 DataLoader 打包后再解包错位
+        result=H_func(text,req,classifier)
+        pred=torch.tensor(result[3],dtype=torch.float32)  # result[3] 是文本自身的领域权重向量
+        gt  =torch.tensor(label,dtype=torch.float32)      # label 转为浮点以匹配 BCELoss
+        sample_loss=loss(pred,gt)
+        total_loss+=sample_loss.item()
+        p+=1
+        print("新闻:",text)
+        print("价值参数:",result[0:3])
+        print("loss:",sample_loss.item())
+    print("平均 loss:",total_loss/p if p else 0.0)
+    #短文本Loss还是高
