@@ -12,6 +12,8 @@ import sentence_transformers
 '''
 H=entropy(text)*cosine_similarity(domain_weight_vector,domain_weight_req)
 其中：两个领域是通过监督学习预测得到的向量进行零中心化后得到的标准向量
+这里假设各样本是分布在超立方体壳上的（超立方体壳厚度小，可以用角度衡量）
+针对垂直领域，需要考虑壳厚度
 '''
 import torch.nn as nn
 
@@ -21,6 +23,7 @@ import torch.nn as nn
 ###领域标签设计为控件，以便用户自主配置
 #######-----------Starting-----------------####
 #识文解意的爱书人明白文字中的价值。
+DFSTOPWORDPATH=os.path.dirname(os.path.abspath(__file__))+'/stopwords.txt'
 SIM_THRESHOLD=0.6
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(PROJECT_DIR, 'models', 'paraphrase-multilingual-MiniLM-L12-v2')
@@ -66,7 +69,7 @@ def get_bigram_tf(word):
             bigram_tf[(word[i], word[i + 1])] = bigram_tf.get(
                 (word[i], word[i + 1]), 0) + 1
         return bigram_tf
-def entropy(text,stopword=os.path.dirname(os.path.abspath(__file__))+'/stopwords.txt'):
+def entropy(text,stopword=DFSTOPWORDPATH):
     stopwords=open(stopword,'r',encoding='utf-8').read().splitlines()
     words=jieba.cut(text)
     split_word=[]

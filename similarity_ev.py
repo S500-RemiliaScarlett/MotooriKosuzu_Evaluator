@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*-coding: utf-8 -*-
 import hashlib
-import transformer
+import transformers
 import keybert
 def kw_extract(text,Model='models\paraphrase-multilingual-MiniLM-L12-v2',topk=5,stop_words='chinese',keyphrase_ngram_range=(1, 3)):
     '''
