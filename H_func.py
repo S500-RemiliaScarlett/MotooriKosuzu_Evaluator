@@ -171,7 +171,7 @@ def keyword_match(text:str, req:str, model_path):
 
     span = (max(locations) - min(locations) + 1) / len(Tseg)
     density_score = math.exp(-2 * span)
-    return match_score * density_score
+    return math.tanh(match_score * density_score)
     ###带权的最长子序列
     #关键词应当以名词为主，动词为次进行
     #关键词密集出现比分散出现的信息更容易强调客户端要求，且根据人的注意力衰减机制，如果文字太长关键词过于分散会导致人的兴趣下降、阅读困难
@@ -191,7 +191,7 @@ def H_func(text:str,req:str,classifier_function,kw_model=MODEL_PATH):
     else:
         cosine_similarity = dot_product / (norm_a * norm_b)
     match_rank=keyword_match(text,req,kw_model)
-    return [entr * (abs(cosine_similarity)**(2-match_rank)),cosine_similarity,match_rank,domain_weight_vector,domain_weight_req]
+    return [entr * (match_rank>=0.75 and cosine_similarity>=0.75)/len(text),cosine_similarity,match_rank,domain_weight_vector,domain_weight_req]
 class domain_classifier(torch.nn.Module):
     def __init__(self, num_domains,model=MODEL_PATH):
         super().__init__()
