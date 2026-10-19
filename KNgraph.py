@@ -41,3 +41,8 @@ class evententity(entity):
         self.platform=platform
         self.reactiondata=reactiondata#所有互动的数据表
         self.topic=topic
+class fieldentity(entity):
+    def __init__(self,Id,text,etype,**kwargs):
+        super().__init__(Id,text)
+        self.etype=etype
+        self.details=kwargs

@@ -24,11 +24,11 @@
    - Hash 层：SimHash 计算哈希相似度 S，排除 S > alpha 的重复文本
    - 一义多表述修正层：sim(x,y) = S(x,y) * exp(-D(x,y) + 1)，D 为相似图最短路
 3. 相似事件群
-   - 相似图 G 构建（sim > 0.8 连边）
+   - 相似图 G 构建（sim > 0.8 或共享关键领域实体连边）
    - 谱聚类分割（numpy 可用时；否则回退连通分量）
    - 每群取 H 最大者为中心
 4. 传播影响力
-   - tanh(N + log2(M) + min(1, log10(X/T)))
+   - tanh(N + 0.5*log2(M) + 0.2*log10(X/T + 1e-9))
 5. 关联支撑度
    - 混合有向/无向图统一为有向图，求入边支撑贡献之和
    - 额外证据补正：因果图根节点最短路 1/D
@@ -70,6 +70,14 @@ SUPPORT_WEIGHT = {
 # 相似图连边阈值 / 冗余去重阈值
 SIM_EDGE_THRESHOLD = 0.8   # sim > 0.8 连边
 DUP_ALPHA = 0.95           # SimHash 相似度 S > alpha 视为重复文本
+
+# 下层 TWS 领域本体六大实体类型（《TWS 领域本体设计说明书》§4.1）
+FIELD_ENTITY_TYPES = ['product_model', 'tech_solution', 'feature',
+                      'usage_scenario', 'quality_issue', 'user_group']
+
+# 相似图「共享实体连边」判定：两事件共享这些类型之一的领域实体即连边
+# （《Day2交付物.md》相似事件群：p.etype ∈ {product_model, quality_issue, tech_solution}）
+SHARED_ENTITY_EDGE_TYPES = {'product_model', 'quality_issue', 'tech_solution'}
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +169,31 @@ class EventEntity(Entity):
         return e
 
 
+class FieldEntity(Entity):
+    """领域实体（对应 KNgraph.py 的 fieldentity）。
+
+    承载《TWS 领域本体设计说明书》§4 的下层六大实体类型，etype 取值：
+        product_model / tech_solution / feature /
+        usage_scenario / quality_issue / user_group
+    details 存该实体的属性（如 brand/model_name、tech_name/tech_type 等），
+    与 §4.2 各实体类型的属性表对应。
+    """
+
+    def __init__(self, Id, text, etype, **details):
+        super().__init__(Id, text)
+        self.etype = etype
+        self.details = details
+
+    def to_dict(self):
+        d = super().to_dict()
+        d.update({"etype": self.etype, "details": self.details})
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d["Id"], d["text"], d.get("etype"), **(d.get("details") or {}))
+
+
 # ---------------------------------------------------------------------------
 # SimHash（Hash 层）
 # ---------------------------------------------------------------------------
@@ -217,7 +250,9 @@ class KnowledgeGraph:
     """知识图谱：管理实体 / 关系 / 三元组，并实现 Day2 的分析函数。"""
 
     def __init__(self, simhash=None):
-        self.entities = {}           # Id -> Entity（以字典管理，便于按 Id 检索）
+        self.entities = {}           # Id -> Entity（事件实体，以字典管理，便于按 Id 检索）
+        self.field_entities = {}     # Id -> FieldEntity（下层领域实体）
+        self.event_fields = defaultdict(set)  # 事件 Id -> 挂接的领域实体 Id 集合
         self.relations = set()       # Relation 集合
         self.triples = []            # (head_Id, relation, tail_Id)
         self.simhash = simhash or SimHash()
@@ -238,11 +273,33 @@ class KnowledgeGraph:
         if Id not in self.entities:
             return False
         del self.entities[Id]
+        self.event_fields.pop(Id, None)
         self.relations = {r for r in self.relations
                           if r.Id1 != Id and r.Id2 != Id}
         self.triples = [t for t in self.triples
                         if t[0] != Id and t[2] != Id]
         return True
+
+    def add_field_entity(self, entity):
+        """添加下层领域实体（FieldEntity）。"""
+        self.field_entities[entity.Id] = entity
+
+    def get_field_entity(self, Id):
+        """按 Id 获取领域实体，不存在返回 None。"""
+        return self.field_entities.get(Id)
+
+    def link_event_field(self, event_Id, field_Id):
+        """把领域实体挂接到事件实体（事件 Id -> 领域实体 Id）。
+
+        同一领域实体被多条事件文本提及时，这些事件在相似图层面视为相连
+        （见 build_similarity_graph / _share_key_entity）。
+        """
+        if event_Id in self.entities and field_Id in self.field_entities:
+            self.event_fields[event_Id].add(field_Id)
+
+    def get_event_fields(self, event_Id):
+        """返回事件挂接的领域实体 Id 集合。"""
+        return self.event_fields.get(event_Id, set())
 
     def add_relation(self, relation):
         """添加关系（边）。"""
@@ -278,12 +335,21 @@ class KnowledgeGraph:
     # 邻接与最短路
     # ------------------------------------------------------------------
     def _similarity_adj(self):
-        """相似图邻接表（无向，仅 similarity 边）。"""
+        """相似图邻接表（无向）：similarity 边 + 共享关键领域实体连边。
+
+        与 build_similarity_graph 口径一致（《Day2交付物.md》相似事件群）。
+        """
         adj = defaultdict(set)
         for r in self.relations:
             if r.tp == 'similarity':
                 adj[r.Id1].add(r.Id2)
                 adj[r.Id2].add(r.Id1)
+        events = list(self.event_fields.keys())
+        for i in range(len(events)):
+            for j in range(i + 1, len(events)):
+                if self._share_key_entity(events[i], events[j]):
+                    adj[events[i]].add(events[j])
+                    adj[events[j]].add(events[i])
         return adj
 
     def _directed_edges(self):
@@ -395,8 +461,25 @@ class KnowledgeGraph:
     # ------------------------------------------------------------------
     # 相似事件群
     # ------------------------------------------------------------------
+    def _share_key_entity(self, a_Id, b_Id):
+        """两事件是否共享某个关键领域实体（etype ∈ SHARED_ENTITY_EDGE_TYPES）。"""
+        common = self.event_fields.get(a_Id, set()) & self.event_fields.get(b_Id, set())
+        for fid in common:
+            fe = self.field_entities.get(fid)
+            if fe is not None and fe.etype in SHARED_ENTITY_EDGE_TYPES:
+                return True
+        return False
+
     def build_similarity_graph(self, threshold=SIM_EDGE_THRESHOLD):
-        """构建相似图 G = (N, E)，E = {sim(x,y) > threshold}，返回邻接表。"""
+        """构建相似图 G = (N, E)，返回邻接表。
+
+        E = { sim(x,y) > threshold }
+            ∪ { x,y 共享关键领域实体 p，p.etype ∈ {product_model,
+                quality_issue, tech_solution} }（《Day2交付物.md》相似事件群）。
+
+        说明：sim(x,y) 的一义多表述修正项 exp(-D+1) 依赖本图最短路 D，
+        故连边以 Hash 层 S 为基准自举，修正层在 similarity() 中叠加。
+        """
         adj = defaultdict(set)
         ents = self.get_entities()
         for i in range(len(ents)):
@@ -404,7 +487,39 @@ class KnowledgeGraph:
                 if self.simhash_similarity(ents[i], ents[j]) > threshold:
                     adj[ents[i].Id].add(ents[j].Id)
                     adj[ents[j].Id].add(ents[i].Id)
+        # 共享关键领域实体连边（无需 sim 超过阈值）
+        for i in range(len(ents)):
+            for j in range(i + 1, len(ents)):
+                if self._share_key_entity(ents[i].Id, ents[j].Id):
+                    adj[ents[i].Id].add(ents[j].Id)
+                    adj[ents[j].Id].add(ents[i].Id)
         return adj
+
+    def link_by_shared_entity(self):
+        """实体共现 → 事件级边（《打分公式修复清单》问题3）。
+
+        共享同一关键领域实体（产品/技术/问题）的两个事件之间补一条事件级边：
+        - 共享质量问题（quality_issue）→ topicsim 边（同问题）；
+        - 共享产品型号 / 技术方案 → similarity 边。
+
+        这样「AirPods 降噪差」与「AirPods 降噪衰减」会因共享 qi_* 互相关联，
+        关联支撑度 support_degree（只统计 self.relations）才有区分度。
+        """
+        ent2ids = defaultdict(list)
+        for eid, fids in self.event_fields.items():
+            for fid in fids:
+                fe = self.field_entities.get(fid)
+                if fe is None or fe.etype not in SHARED_ENTITY_EDGE_TYPES:
+                    continue
+                ent2ids[fid].append(eid)
+        for fid, ids in ent2ids.items():
+            if len(ids) < 2:
+                continue
+            fe = self.field_entities.get(fid)
+            tp = 'topicsim' if (fe is not None and fe.etype == 'quality_issue') else 'similarity'
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    self.add_relation(Relation(ids[i], ids[j], tp, direction='same'))
 
     def similar_event_groups(self, threshold=SIM_EDGE_THRESHOLD):
         """对相似图 G 做连通分量分割，返回 [[Id, ...], ...]。
@@ -486,7 +601,7 @@ class KnowledgeGraph:
     # 传播影响力
     # ------------------------------------------------------------------
     def propagation_influence(self, nodes):
-        """影响力 = tanh(N + log2(M) + min(1, log10(X/T)))。
+        """影响力 = tanh(N + 0.5*log2(M) + 0.2*log10(X/T + 1e-9))。
 
         N: 来源平台数；M: 节点总数；X: 文本互动总量；T: 时间跨度（天）。
         """
@@ -517,7 +632,9 @@ class KnowledgeGraph:
                 T = 1.0
         else:
             T = 1.0
-        term = N + math.log2(max(M, 1)) + min(1.0, math.log10(max(X / T, 1e-9)))
+        # 问题2修复：平滑对数、去掉 min(1, …) 硬截断、零互动不再惩罚到 -1。
+        # 三项都带 log(1+…)，从 0 平滑起跳；系数 0.4/0.3/0.3 避免 tanh 过早饱和。
+        term = 0.4 * math.log2(1 + N) + 0.3 * math.log2(1 + M) + 0.3 * math.log10(1 + X / T)
         return math.tanh(term)
 
     # ------------------------------------------------------------------
@@ -612,21 +729,25 @@ class KnowledgeGraph:
     # ------------------------------------------------------------------
     # 价值判定
     # ------------------------------------------------------------------
-    def value_H(self, entity, entropy=None, fmatch=0.0, kwmatch=0.0,
-                candidates=None):
+    def value_H(self, entity, fmatch=0.0, kwmatch=0.0,
+                entity_count=None, relation_count=None, candidates=None):
         """H = M * DS(T) * (1 - Sim(T))。
 
         M   = need_match_flag(fmatch, kwmatch)
-        DS  = 信息密度 = 熵 / 文本长度
+        DS  = 信息密度 = log2(领域信号数) / log2(有效长度)（问题1修复）
         Sim = 冗余度（其他文本 sim 的最大值）
-        fmatch / kwmatch 需由外部（H_func.py 的领域分类器与关键词匹配）提供。
+        fmatch / kwmatch 需由外部（H_func.py 的领域分类器与关键词匹配）提供；
+        entity_count / relation_count 缺省时从图谱挂接的领域实体/关系自动统计。
         """
         e = entity if isinstance(entity, Entity) else self.entities.get(entity)
         if e is None:
             return 0.0
-        if entropy is None:
-            entropy = char_entropy(e.text)
-        DS = information_density(entropy, len(e.text))
+        if entity_count is None:
+            entity_count = len(self.event_fields.get(e.Id, ()))
+        if relation_count is None:
+            relation_count = sum(1 for r in self.relations
+                                 if r.Id1 == e.Id or r.Id2 == e.Id)
+        DS = information_density(e.text, entity_count, relation_count)
         M = need_match_flag(fmatch, kwmatch)
         Sim = self.redundancy(e, candidates)
         return M * DS * (1.0 - Sim)
@@ -637,6 +758,10 @@ class KnowledgeGraph:
     def to_dict(self):
         return {
             "entities": [e.to_dict() for e in self.entities.values()],
+            "field_entities": [e.to_dict() for e in self.field_entities.values()],
+            "event_fields": [[eid, fid]
+                             for eid, fids in self.event_fields.items()
+                             for fid in fids],
             "relations": [r.to_dict() for r in self.relations],
             "triples": [(h, r.to_dict(), t) for (h, r, t) in self.triples],
         }
@@ -649,6 +774,10 @@ class KnowledgeGraph:
                 kg.add_entity(EventEntity.from_dict(ed))
             else:
                 kg.add_entity(Entity.from_dict(ed))
+        for fd in d.get("field_entities", []):
+            kg.add_field_entity(FieldEntity.from_dict(fd))
+        for (eid, fid) in d.get("event_fields", []):
+            kg.link_event_field(eid, fid)
         for rd in d.get("relations", []):
             kg.add_relation(Relation.from_dict(rd))
         for (h, rd, t) in d.get("triples", []):
@@ -703,13 +832,25 @@ def char_entropy(text):
     return entr
 
 
-def information_density(entropy, length):
-    """信息密度 DS = 熵 / 文本长度。"""
-    return entropy / length if length > 0 else 0.0
+def information_density(text, entity_count=0, relation_count=0):
+    """信息密度 DS = log2(领域信号数) / log2(有效长度)。
+
+    领域信号数 = 1 + 实体数 + 关系数，越「单位长度里塞的领域实体/关系越多」越高分；
+    有效长度取 max(len(text), 40) 作下限，杜绝短水帖因「单位字符信息量」虚高。
+    （《打分公式修复清单》问题1：原「熵/长度」天然偏向短文本且无长度下限。）
+    """
+    L = max(len(text), 40)
+    signals = 1 + (entity_count or 0) + (relation_count or 0)
+    return math.log2(signals + 1) / math.log2(L)
 
 
-def need_match_flag(fmatch, kwmatch, threshold=0.75):
-    """需求契合标志 M = (FMatch>0.75 && KWMatch>0.75) -> {0,1}。"""
+def need_match_flag(fmatch, kwmatch, threshold=0.3):
+    """需求契合标志 M = (FMatch>阈值 && KWMatch>阈值) -> {0,1}。
+
+    阈值由 0.75 改为 0.3：原 0.75 是针对「通用分类器余弦相似度」标定的；
+    改用 TWS 单域过滤器（域内概率，TWS≈1.0、非TWS≈0）+ 词表关键词匹配（TWS≈0.6~1、
+    非TWS≈0）后量纲不同，0.3 即可干净分离 TWS / 非 TWS（见 main.py 的 _match_scores）。
+    """
     return 1 if (fmatch > threshold and kwmatch > threshold) else 0
 
 
@@ -778,6 +919,21 @@ if __name__ == "__main__":
     for Id in [1, 4]:
         h = kg.value_H(Id, fmatch=0.9, kwmatch=0.9)
         print(f"  H({Id}) =", round(h, 4))
+
+    print("\n== 领域实体挂接与相似图共享实体连边 ==")
+    # 事件 1 与 5 原本只有 topicsim 边（非相似边），通过共享同一个「产品型号」领域实体
+    # 在相似图层面新增一条连边（《Day2交付物.md》相似事件群的实体共指条件）
+    kg.add_field_entity(FieldEntity(100, "高考加分政策", "product_model",
+                                    brand="教育部", model_name="高考加分政策"))
+    kg.add_field_entity(FieldEntity(101, "加分争议", "quality_issue",
+                                    issue_name="加分争议", issue_category="体验"))
+    kg.link_event_field(1, 100)
+    kg.link_event_field(5, 100)
+    kg.link_event_field(5, 101)
+    print("  事件1/5共享关键领域实体:", kg._share_key_entity(1, 5))
+    print("  事件1/2共享关键领域实体:", kg._share_key_entity(1, 2))
+    g2 = kg.build_similarity_graph()
+    print("  共享实体后相似图 5 的邻接:", sorted(g2.get(5, ())))
 
     print("\n== 持久化 ==")
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kg_demo.json")

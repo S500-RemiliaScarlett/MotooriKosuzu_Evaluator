@@ -3,9 +3,13 @@
 import hashlib
 import transformers
 import keybert
-def kw_extract(text,Model='models\paraphrase-multilingual-MiniLM-L12-v2',topk=5,stop_words='chinese',keyphrase_ngram_range=(1, 3)):
+def kw_extract(text,Model='models/paraphrase-multilingual-MiniLM-L12-v2',topk=5,stop_words=None,keyphrase_ngram_range=(1, 3)):
     '''
     keybert可以加载模型
+
+    注意 stop_words 默认改为 None：sklearn 的 CountVectorizer 只接受 'english'、
+    一个 list 或 None，传 'chinese' 会抛 InvalidParameterError，KeyBERT 吞掉异常后
+    返回空列表，进而让 simhash 除零。中文停用词建议显式传一个 list。
     '''
     kb=keybert.KeyBERT(model=Model)
     keywords=kb.extract_keywords(text,top_n=topk,stop_words=stop_words,keyphrase_ngram_range=keyphrase_ngram_range)
@@ -19,6 +23,8 @@ def simhash(s1,s2):
     '''
     kw_set1=list([i for i in kw_extract(s1)])
     kw_set2=list([i for i in kw_extract(s2)])
+    if not kw_set1 or not kw_set2:
+        return 0.0
     hs_list1=[hashlib.sha1(i[0].encode('utf-8')).hexdigest() for i in kw_set1]
     hs_list2=[hashlib.sha1(i[0].encode('utf-8')).hexdigest() for i in kw_set2]
     hs_list1=[bin(int(i,16)).replace('0b','') for i in hs_list1]

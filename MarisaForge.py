@@ -216,6 +216,298 @@ class classifierfunction:
             if(self.single_domain):
                 return output,filter_output
             return output
+# ---------------------------------------------------------------------------
+# 下层 TWS 领域本体：六大实体抽取（通用事件要素抽取模型）
+# ---------------------------------------------------------------------------
+# 依据《TWS 领域本体设计说明书》§4.1 / §4.2 的六大实体：
+#   产品型号 product_model / 技术方案 tech_solution / 功能点 feature /
+#   使用场景 usage_scenario / 质量问题 quality_issue / 用户群体 user_group
+# 模型参考 EVTelemextract.py 的多头 BERT 思路：共享编码器 + 每个实体类型一个
+# 「存在性判断 + 片段定位」头，直接从原文抽出实体名，返回结构化实体信息。
+SIX_ENTITY_TYPES = ['product_model', 'tech_solution', 'feature',
+                    'usage_scenario', 'quality_issue', 'user_group']
+
+# 各实体类型的属性 Schema（§4.2），用于返回实体信息时对齐字段。
+# name_field 为该类型的规范名字段；attributes 为完整属性列表；required 为必填项。
+ENTITY_TYPE_INFO = {
+    'product_model': {
+        'name': '产品型号', 'dimension': '产品形态', 'name_field': 'model_name',
+        'attributes': ['brand', 'model_name', 'alias', 'price', 'release_date', 'wear_form', 'category'],
+        'required': ['brand', 'model_name', 'wear_form'],
+    },
+    'tech_solution': {
+        'name': '技术方案', 'dimension': '技术演化', 'name_field': 'tech_name',
+        'attributes': ['tech_name', 'tech_alias', 'tech_type', 'vendor', 'generation', 'maturity'],
+        'required': ['tech_name', 'tech_type'],
+    },
+    'feature': {
+        'name': '功能点', 'dimension': '产品形态', 'name_field': 'feature_name',
+        'attributes': ['feature_name', 'metric', 'experience', 'feature_type'],
+        'required': ['feature_name', 'feature_type'],
+    },
+    'usage_scenario': {
+        'name': '使用场景', 'dimension': '用户喜好', 'name_field': 'scenario_name',
+        'attributes': ['scenario_name', 'demand', 'related_features', 'target_groups'],
+        'required': ['scenario_name'],
+    },
+    'quality_issue': {
+        'name': '质量问题', 'dimension': '网络舆论', 'name_field': 'issue_name',
+        'attributes': ['issue_name', 'issue_category', 'severity', 'scope', 'related_entities'],
+        'required': ['issue_name', 'issue_category'],
+    },
+    'user_group': {
+        'name': '用户群体', 'dimension': '用户喜好', 'name_field': 'group_name',
+        'attributes': ['group_name', 'traits', 'preferences', 'pain_points'],
+        'required': ['group_name'],
+    },
+}
+
+
+class domainentitymodel(torch.nn.Module):
+    """六大领域实体抽取模型（参考 EVTelemextract.py 的多头 BERT 思路）。
+
+    共享 BERT 编码器，6 个实体头各含三路输出：
+      presence —— 该实体类型是否出现在文本中（raw logits，训练用 BCEWithLogits）；
+      start    —— 每个 token 作为实体名起始位置的 logits；
+      end      —— 每个 token 作为实体名结束位置的 logits。
+
+    与 EVTelemextract.py 的区别：把其中的「pooled 向量回归」改成标准 token 级
+    片段定位（span extraction），从而真正从原文抽出实体名。
+    """
+
+    def __init__(self, model_path):
+        super().__init__()
+        self.tokenizer = BertTokenizer.from_pretrained(model_path)
+        self.bert = BertModel.from_pretrained(model_path)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        hidden = self.bert.config.hidden_size
+        self.presence = torch.nn.ModuleDict({
+            et: torch.nn.Linear(hidden, 1) for et in SIX_ENTITY_TYPES
+        })
+        self.start = torch.nn.ModuleDict({
+            et: torch.nn.Linear(hidden, 1) for et in SIX_ENTITY_TYPES
+        })
+        self.end = torch.nn.ModuleDict({
+            et: torch.nn.Linear(hidden, 1) for et in SIX_ENTITY_TYPES
+        })
+        self.to(self.device)
+
+    def _encode(self, text):
+        """编码文本，返回 (input_ids, attention_mask, last_hidden_state, pooled)。"""
+        enc = self.tokenizer(text, return_tensors='pt', padding=True, truncation=True)
+        input_ids = enc['input_ids'].to(self.device)
+        attention_mask = enc['attention_mask'].to(self.device)
+        hidden = self.bert(input_ids, attention_mask=attention_mask).last_hidden_state
+        mask = attention_mask.unsqueeze(-1).float()
+        pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+        return input_ids, attention_mask, hidden, pooled
+
+    def forward(self, text):
+        """返回 (presence, start, end, input_ids, attention_mask)。
+
+        presence: dict[etype] -> [B] raw logits
+        start/end: dict[etype] -> [B, L] raw logits（未归一化）
+        """
+        input_ids, attention_mask, hidden, pooled = self._encode(text)
+        presence = {et: self.presence[et](pooled).squeeze(-1)
+                    for et in SIX_ENTITY_TYPES}
+        start = {et: self.start[et](hidden).squeeze(-1) for et in SIX_ENTITY_TYPES}
+        end = {et: self.end[et](hidden).squeeze(-1) for et in SIX_ENTITY_TYPES}
+        return presence, start, end, input_ids, attention_mask
+
+    def extract(self, text, presence_threshold=0.5):
+        """抽取单条文本的六大实体，返回结构化实体信息。
+
+        返回 dict[etype] -> {
+            'present': bool, 'name': str|None, 'confidence': float,
+            'start'/'end': token 下标（仅在 present 时存在）,
+            'attributes': {attr: None}  # 属性留待映射层填充（§8 接口约定）
+        }
+        实体名按字符 offset 从原文精确截取，避免 subword/OOV 造成的拼接与空格问题。
+        """
+        self.eval()
+        with torch.no_grad():
+            presence, start, end, input_ids, attention_mask = self.forward(text)
+        enc = self.tokenizer(text, return_tensors='pt', return_offsets_mapping=True,
+                             truncation=True)
+        offsets = enc['offset_mapping'][0].tolist()  # [(c0, c1), ...]
+        result = {}
+        for et in SIX_ENTITY_TYPES:
+            p = float(torch.sigmoid(presence[et][0]).item())
+            info = {
+                'present': p >= presence_threshold,
+                'name': None,
+                'confidence': p,
+                'attributes': {attr: None for attr in ENTITY_TYPE_INFO[et]['attributes']},
+            }
+            if info['present']:
+                mask = attention_mask[0].float()
+                neg = (1.0 - mask) * -1e9
+                s_prob = torch.softmax(start[et][0] + neg, dim=0)
+                e_prob = torch.softmax(end[et][0] + neg, dim=0)
+                si = int(s_prob.argmax().item())
+                ei = int(e_prob.argmax().item())
+                if ei < si:
+                    si, ei = ei, si
+                info['start'], info['end'] = si, ei
+                cs = offsets[si][0] if si < len(offsets) else 0
+                ce = offsets[ei][1] if ei < len(offsets) else 0
+                if cs < ce:
+                    info['name'] = text[cs:ce].strip()
+            result[et] = info
+        return result
+
+
+class entityextractdataset(torch.utils.data.Dataset):
+    """六大实体抽取数据集：每条样本 (text, spans, presences)。
+
+    spans:     dict[etype] -> [start_token, end_token] 或 None
+    presences: dict[etype] -> 0/1
+    """
+
+    def __init__(self, texts, spans, presences):
+        self.texts = texts
+        self.spans = spans
+        self.presences = presences
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        return self.texts[idx], self.spans[idx], self.presences[idx]
+
+
+def _entity_collate(batch):
+    """自定义 collate：返回 (texts, spans, presences) 三个 list，
+    避免默认 collate 对 str/dict/None 的折叠出错。"""
+    return [b[0] for b in batch], [b[1] for b in batch], [b[2] for b in batch]
+
+
+class entityextractor:
+    """六大领域实体抽取的封装（对应 classifierfunction 的角色）。
+
+    用法：
+      ex = entityextractor(MODEL_PATH)
+      ex.load_dataset('dataset.json')            # 载入标注数据
+      ex.train(epochs, batch, lr, 'entity.pth')   # 训练并保存
+      info = ex.extract(text, 'entity.pth')       # 抽取单条文本，返回实体信息
+      ents = ex.extract_entities(text, 'entity.pth')  # 只返回 present 的实体列表
+    """
+
+    def __init__(self, model_path):
+        self.model = domainentitymodel(model_path)
+        self.dataset = None
+
+    def load_dataset(self, file_path, text_key="text", entity_key="entity"):
+        """载入标注数据。
+
+        数据文件 JSON 格式：
+          {"data": [{"text": "...",
+                     "entity": {"product_model": [start, end] | null, ...}}]}
+        entity 中每个实体类型给出字符级 [起始, 结束]（左闭右闭，实体名 = text[s:e+1]），
+        null 表示该类型未出现。此处按 tokenizer 的 offset_mapping 把字符区间
+        映射为 token 区间，供训练使用。
+        """
+        with open(file_path, encoding="utf-8") as f:
+            data = json.load(f).get("data", [])
+        texts, spans, presences = [], [], []
+        for item in data:
+            text = item[text_key]
+            ents = item.get(entity_key, {})
+            enc = self.model.tokenizer(
+                text, return_tensors='pt', return_offsets_mapping=True,
+                truncation=True, max_length=self.model.tokenizer.model_max_length)
+            offsets = enc['offset_mapping'][0].tolist()  # [(c0, c1), ...]
+            span_map, pres = {}, {}
+            for et in SIX_ENTITY_TYPES:
+                val = ents.get(et)
+                if not (isinstance(val, (list, tuple)) and len(val) >= 2):
+                    span_map[et] = None
+                    pres[et] = 0
+                    continue
+                cs, ce = val[0], val[1]
+                ts = te = None
+                for ti, (c0, c1) in enumerate(offsets):
+                    if c0 == c1:          # 特殊 token（[CLS]/[SEP]/[PAD]）
+                        continue
+                    if cs < c1 and ce >= c0:   # token 与字符区间 [cs, ce] 重叠
+                        if ts is None:
+                            ts = ti
+                        te = ti
+                if ts is None:
+                    span_map[et] = None
+                    pres[et] = 0
+                else:
+                    span_map[et] = [ts, te]
+                    pres[et] = 1
+            texts.append(text)
+            spans.append(span_map)
+            presences.append(pres)
+        self.dataset = entityextractdataset(texts, spans, presences)
+
+    def train(self, epochs, batch_size, learning_rate, param_path, pre_trained_params=None):
+        """训练六大实体抽取模型（冻结 BERT，只训各实体头）。"""
+        if self.dataset is None:
+            print("请先调用 load_dataset 载入标注数据")
+            return
+        if pre_trained_params is not None:
+            self.model.load_state_dict(torch.load(pre_trained_params))
+        self.model.train()
+        self.model.bert.requires_grad_(False)
+        self.model.bert.eval()
+        loader = torch.utils.data.DataLoader(
+            self.dataset, batch_size=batch_size, shuffle=True, collate_fn=_entity_collate)
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            lr=learning_rate, weight_decay=1e-4)
+        bce = torch.nn.BCEWithLogitsLoss()
+        for ep in range(epochs):
+            for bid, (texts, spans, presences) in enumerate(loader):
+                optimizer.zero_grad()
+                presence, start, end, input_ids, _ = self.model(texts)
+                B = input_ids.size(0)
+                loss = torch.zeros((), device=self.model.device)
+                for et in SIX_ENTITY_TYPES:
+                    p_target = torch.tensor(
+                        [presences[i][et] for i in range(B)],
+                        dtype=torch.float32, device=self.model.device)
+                    loss = loss + bce(presence[et], p_target)
+                    valid = p_target > 0.5
+                    if valid.any():
+                        s_t = torch.tensor(
+                            [spans[i][et][0] if spans[i][et] else 0 for i in range(B)],
+                            dtype=torch.long, device=self.model.device)
+                        e_t = torch.tensor(
+                            [spans[i][et][1] if spans[i][et] else 0 for i in range(B)],
+                            dtype=torch.long, device=self.model.device)
+                        s_loss = torch.nn.functional.cross_entropy(
+                            start[et], s_t, reduction='none')
+                        e_loss = torch.nn.functional.cross_entropy(
+                            end[et], e_t, reduction='none')
+                        loss = loss + ((s_loss + e_loss) * valid).sum() / valid.sum().clamp(min=1)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+                if bid % 10 == 0:
+                    print("轮次:%d\t样本数:%d\t损失:%.5f" % (ep + 1, bid + 1, loss.item()))
+        print("正在保存六大实体抽取模型参数")
+        torch.save(self.model.state_dict(), param_path)
+
+    def extract(self, text, param_path=None, presence_threshold=0.5):
+        """抽取单条文本的六大实体，返回 dict[etype] -> 实体信息。"""
+        if param_path is not None:
+            self.model.load_state_dict(
+                torch.load(param_path, map_location=self.model.device))
+        return self.model.extract(text, presence_threshold)
+
+    def extract_entities(self, text, param_path=None, presence_threshold=0.5):
+        """抽取并只返回 present 的实体列表（每个元素含 etype/name/confidence/attributes）。"""
+        info = self.extract(text, param_path, presence_threshold)
+        out = []
+        for et in SIX_ENTITY_TYPES:
+            if info[et]['present']:
+                out.append(dict(info[et], etype=et))
+        return out
 if __name__=="__main__":
     print("Welcome To Marisa Forge")
     print("Instructions:")

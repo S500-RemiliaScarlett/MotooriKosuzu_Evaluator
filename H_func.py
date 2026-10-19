@@ -170,7 +170,7 @@ def keyword_match(text:str, req:str, model_path):
         return 0.0
 
     span = (max(locations) - min(locations) + 1) / len(Tseg)
-    density_score = math.exp(-2 * span)
+    density_score = math.exp(-1e-4*span)
     return math.tanh(match_score * density_score)
     ###带权的最长子序列
     #关键词应当以名词为主，动词为次进行
@@ -183,6 +183,8 @@ def H_func(text:str,req:str,classifier_function,kw_model=MODEL_PATH):
     domain_weight_req=classifier_function(req)
     v = domain_weight_vector - domain_weight_vector.mean()
     r = domain_weight_req - domain_weight_req.mean()
+    #熵密度改为S(1-(tanh(l/k))^5),使得：短文本由熵直接决定，长文本再考虑注意衰减
+    
     dot_product = float((v * r).sum())
     norm_a = math.sqrt(float((v * v).sum()))
     norm_b = math.sqrt(float((r * r).sum()))
@@ -191,7 +193,7 @@ def H_func(text:str,req:str,classifier_function,kw_model=MODEL_PATH):
     else:
         cosine_similarity = dot_product / (norm_a * norm_b)
     match_rank=keyword_match(text,req,kw_model)
-    return [entr * (match_rank>=0.75 and cosine_similarity>=0.75)/len(text),cosine_similarity,match_rank,domain_weight_vector,domain_weight_req]
+    return [entr * (match_rank>=0.75 and cosine_similarity>=0.75)*(1-(math.tanh(len(text)/305))**5),cosine_similarity,match_rank,domain_weight_vector,domain_weight_req]
 class domain_classifier(torch.nn.Module):
     def __init__(self, num_domains,model=MODEL_PATH):
         super().__init__()
